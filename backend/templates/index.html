@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Facturación Verifactu simplificada</title>
+<style>
+  body { font-family: sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; color: #222; }
+  h1 { color: #1a4d8f; }
+  fieldset { margin-bottom: 25px; padding: 15px; border-radius: 8px; border: 1px solid #ccc; }
+  label { display: block; margin-top: 8px; font-size: 0.9em; }
+  input, select { width: 100%; padding: 6px; box-sizing: border-box; }
+  button { margin-top: 12px; padding: 8px 16px; background: #1a4d8f; color: white; border: none; border-radius: 5px; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  td, th { border: 1px solid #ddd; padding: 6px; font-size: 0.85em; }
+  .msg { color: #b00; font-size: 0.9em; }
+  .ok { color: #060; }
+</style>
+</head>
+<body>
+<h1>Facturación Verifactu simplificada</h1>
+<p>MVP para autónomos con poco volumen. Genera facturas con hash encadenado y QR tributario conforme a la Orden HAC/1177/2024.</p>
+
+<fieldset>
+  <legend>1. Alta de cliente</legend>
+  <label>Nombre / Razón social <input id="c_nombre"></label>
+  <label>NIF/CIF <input id="c_nif"></label>
+  <label>Dirección <input id="c_direccion"></label>
+  <label>Email <input id="c_email"></label>
+  <button onclick="altaCliente()">Dar de alta cliente</button>
+  <div id="cliente_msg" class="msg"></div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Emitir factura</legend>
+  <label>Cliente
+    <select id="f_cliente"></select>
+  </label>
+  <label>Concepto <input id="f_concepto"></label>
+  <label>Base imponible (€) <input id="f_base" type="number" step="0.01"></label>
+  <label>% IVA <input id="f_iva" type="number" value="21"></label>
+  <label>% Retención IRPF <input id="f_irpf" type="number" value="0"></label>
+  <button onclick="emitirFactura()">Emitir factura</button>
+  <div id="factura_msg" class="msg"></div>
+</fieldset>
+
+<fieldset>
+  <legend>3. Facturas emitidas</legend>
+  <table id="tabla_facturas">
+    <thead><tr><th>Nº</th><th>Cliente</th><th>Total</th><th>Hash</th><th>PDF</th><th>Pagar (test)</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</fieldset>
+
+<script>
+async function cargarClientes() {
+  const r = await fetch('/api/clientes');
+  const data = await r.json();
+  const sel = document.getElementById('f_cliente');
+  sel.innerHTML = data.map(c => `<option value="${c.id}">${c.nombre} (${c.nif})</option>`).join('');
+}
+
+async function altaCliente() {
+  const body = {
+    nombre: document.getElementById('c_nombre').value,
+    nif: document.getElementById('c_nif').value,
+    direccion: document.getElementById('c_direccion').value,
+    email: document.getElementById('c_email').value,
+  };
+  const r = await fetch('/api/clientes', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const data = await r.json();
+  const msg = document.getElementById('cliente_msg');
+  if (r.ok) { msg.className='ok'; msg.textContent = 'Cliente creado: ' + data.nombre; cargarClientes(); }
+  else { msg.className='msg'; msg.textContent = data.error; }
+}
+
+async function emitirFactura() {
+  const body = {
+    cliente_id: parseInt(document.getElementById('f_cliente').value),
+    concepto: document.getElementById('f_concepto').value,
+    base_imponible: parseFloat(document.getElementById('f_base').value),
+    tipo_iva: parseFloat(document.getElementById('f_iva').value),
+    tipo_irpf: parseFloat(document.getElementById('f_irpf').value),
+  };
+  const r = await fetch('/api/facturas', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const data = await r.json();
+  const msg = document.getElementById('factura_msg');
+  if (r.ok) { msg.className='ok'; msg.textContent = 'Factura ' + data.numserie + ' emitida. Total: ' + data.total + ' €'; cargarFacturas(); }
+  else { msg.className='msg'; msg.textContent = data.error; }
+}
+
+async function pagarFactura(id) {
+  const r = await fetch(`/api/facturas/${id}/pagar`, {method:'POST'});
+  const data = await r.json();
+  if (r.ok) {
+    await fetch(`/api/facturas/${id}/confirmar_pago`, {method:'POST'});
+    alert('Pago de prueba (Stripe TEST) simulado y confirmado.');
+    cargarFacturas();
+  } else {
+    alert(data.error);
+  }
+}
+
+async function cargarFacturas() {
+  const r = await fetch('/api/facturas');
+  const data = await r.json();
+  const tbody = document.querySelector('#tabla_facturas tbody');
+  tbody.innerHTML = data.map(f => `<tr>
+    <td>${f.numserie}</td>
+    <td>${f.cliente ? f.cliente.nombre : ''}</td>
+    <td>${f.total} €</td>
+    <td title="${f.hash_registro}">${f.hash_registro.slice(0,10)}...</td>
+    <td><a href="/api/facturas/${f.id}/pdf" target="_blank">PDF</a></td>
+    <td>${f.pagada ? 'Pagada ✅' : `<button onclick="pagarFactura(${f.id})">Pagar (test)</button>`}</td>
+  </tr>`).join('');
+}
+
+cargarClientes();
+cargarFacturas();
+</script>
+</body>
+</html>
