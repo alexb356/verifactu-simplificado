@@ -11,11 +11,13 @@ IMPORTANTE (ver NORMATIVA.md y RESUMEN.md):
 import os
 import hashlib
 import io
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from flask import Flask, request, jsonify, send_file, render_template
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import IntegrityError
 from dotenv import load_dotenv
 import qrcode
 from reportlab.lib.pagesizes import A4
@@ -28,8 +30,17 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "dev-only-not-secure")
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL", "sqlite:///verifactu.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB: mitiga DoS por payload gigante
 
 db = SQLAlchemy(app)
+
+
+@app.after_request
+def _cabeceras_seguridad(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return resp
 
 AEAT_QR_BASE_URL = "https://www2.agenciatributaria.gob.es/wlpl/TIKE-CONT/ValidarQR"
 
@@ -66,6 +77,14 @@ class Factura(db.Model):
     stripe_payment_intent = db.Column(db.String(120))
 
     cliente = db.relationship("Cliente")
+
+    __table_args__ = (
+        # Garantiza a nivel de BD que no puede haber dos facturas con el mismo
+        # número en la misma serie, ni dos con el mismo hash_anterior (evita
+        # bifurcaciones de la cadena Verifactu por condiciones de carrera).
+        db.UniqueConstraint("serie", "numero", name="uq_factura_serie_numero"),
+        db.UniqueConstraint("hash_anterior", name="uq_factura_hash_anterior"),
+    )
 
     @property
     def numserie(self):
@@ -221,27 +240,38 @@ def facturas():
 
         emisor_nif = os.environ.get("EMISOR_NIF", "B00000000")
         serie = "A"
-        numero = siguiente_numero(serie)
-        fecha = datetime.now(timezone.utc)
-        fecha_str = fecha.strftime("%d-%m-%Y")
-        numserie = f"{serie}-{numero:06d}"
-
         base_r = round(base_imponible, 2)
         cuota_iva = round(base_r * tipo_iva / 100, 2)
         retencion = round(base_r * tipo_irpf / 100, 2)
         total = round(base_r + cuota_iva - retencion, 2)
 
-        hash_anterior = ultimo_hash()
-        hash_registro = calcular_hash_registro(emisor_nif, numserie, fecha_str, total, hash_anterior)
+        # Reintento ante condición de carrera: si dos peticiones concurrentes intentan
+        # emitir factura a la vez, la restricción UNIQUE de BD rechazará a la que pierda
+        # la carrera; recalculamos número/hash con los datos frescos y reintentamos.
+        # Esto es la garantía real de integridad de la cadena Verifactu (un simple
+        # candado en memoria no protegería entre procesos/workers distintos).
+        for _intento in range(5):
+            numero = siguiente_numero(serie)
+            fecha = datetime.now(timezone.utc)
+            fecha_str = fecha.strftime("%d-%m-%Y")
+            numserie = f"{serie}-{numero:06d}"
+            hash_anterior = ultimo_hash()
+            hash_registro = calcular_hash_registro(emisor_nif, numserie, fecha_str, total, hash_anterior)
 
-        factura = Factura(
-            serie=serie, numero=numero, cliente_id=cliente.id, concepto=concepto,
-            base_imponible=base_r, tipo_iva=tipo_iva, tipo_irpf=tipo_irpf,
-            fecha_emision=fecha, hash_registro=hash_registro, hash_anterior=hash_anterior,
-        )
-        db.session.add(factura)
-        db.session.commit()
-        return jsonify(factura.to_dict()), 201
+            factura = Factura(
+                serie=serie, numero=numero, cliente_id=cliente.id, concepto=concepto,
+                base_imponible=base_r, tipo_iva=tipo_iva, tipo_irpf=tipo_irpf,
+                fecha_emision=fecha, hash_registro=hash_registro, hash_anterior=hash_anterior,
+            )
+            db.session.add(factura)
+            try:
+                db.session.commit()
+                return jsonify(factura.to_dict()), 201
+            except IntegrityError:
+                db.session.rollback()
+                time.sleep(0.02 * (_intento + 1))
+        return jsonify({"error": "no se pudo emitir la factura por alta concurrencia, "
+                                  "inténtalo de nuevo"}), 409
 
     return jsonify([f.to_dict() for f in Factura.query.order_by(Factura.id.desc()).all()])
 
@@ -326,8 +356,21 @@ def pagar_factura(factura_id):
 
 @app.route("/api/facturas/<int:factura_id>/confirmar_pago", methods=["POST"])
 def confirmar_pago(factura_id):
-    """Simula la confirmación de webhook de Stripe en test (marca la factura como pagada)."""
+    """Confirma el pago verificando contra Stripe el PaymentIntent asociado
+    (nunca confiar en que el cliente diga 'ya he pagado' sin comprobarlo)."""
+    import stripe
     factura = Factura.query.get_or_404(factura_id)
+    if not factura.stripe_payment_intent:
+        return jsonify({"error": "esta factura no tiene un intento de pago Stripe asociado"}), 400
+    stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+    if not stripe.api_key or not stripe.api_key.startswith("sk_test_"):
+        return jsonify({"error": "Stripe no configurado en modo TEST"}), 400
+    try:
+        intent = stripe.PaymentIntent.retrieve(factura.stripe_payment_intent)
+    except stripe.error.StripeError as exc:
+        return jsonify({"error": f"No se pudo verificar el pago en Stripe: {exc.user_message or str(exc)}"}), 502
+    if intent.status != "succeeded":
+        return jsonify({"error": f"el pago no está confirmado en Stripe (estado: {intent.status})"}), 402
     factura.pagada = True
     db.session.commit()
     return jsonify(factura.to_dict())
@@ -340,4 +383,4 @@ def crear_tablas():
 
 if __name__ == "__main__":
     crear_tablas()
-    app.run(debug=True, port=5001)
+    app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1", port=5001)

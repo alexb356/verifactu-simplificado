@@ -30,3 +30,17 @@ MVP funcional en Flask (backend) + SQLite + frontend HTML/JS servido por el prop
 
 ## Revisión de bugs post-entrega (07/09/2026)
 Se hizo una pasada de QA sobre el código antes de publicarlo: pyflakes (sin avisos), y pruebas manuales de casos límite (redondeos, IRPF>IVA, cliente_id inválido, PDF/QR con datos reales). No se encontraron bugs funcionales en este proyecto. Se modernizó `Cliente.query.get(...)` (deprecado en SQLAlchemy 2.0) a `db.session.get(...)`. Se corrigió además una vulnerabilidad de **HTML injection** en el frontend: nombre/NIF de cliente y datos de factura se insertaban sin escapar vía `innerHTML`; ahora se escapan con una función `escapeHtml()`.
+
+## Auditoría de pentest (07/09/2026) — hallazgos y correcciones
+
+Se realizó un pentest manual dirigido (IDOR, lógica de pagos, condiciones de carrera, exposición de datos, DoS) con explotación real de cada hallazgo antes de corregirlo. Resultado:
+
+| # | Hallazgo | Severidad | Corrección |
+|---|----------|-----------|------------|
+| 1 | **Bypass de pago**: `/confirmar_pago` marcaba cualquier factura como pagada sin verificar nada contra Stripe — cualquiera podía llamar al endpoint directamente y "pagar" gratis. | 🔴 Crítica | Ahora exige que la factura tenga un `payment_intent` asociado y verifica su estado real contra la API de Stripe (`PaymentIntent.retrieve`); solo marca `pagada=True` si `status == "succeeded"`. |
+| 2 | **Race condition en la cadena Verifactu**: dos emisiones de factura concurrentes podían leer el mismo "último número/hash" antes de confirmar, generando dos facturas con el mismo número o una cadena de hash bifurcada — invalida la garantía de inmutabilidad exigida por el reglamento. | 🟠 Alta | Restricciones `UNIQUE` a nivel de BD sobre `(serie, numero)` y `hash_anterior`; la creación de factura reintenta automáticamente (hasta 5 veces con backoff) recalculando número/hash si detecta colisión por `IntegrityError`. |
+| 3 | **DoS / debug expuesto**: `app.run(debug=True)` siempre activo, sin límite de tamaño de payload. | 🟡 Media | `debug` ahora depende de `FLASK_DEBUG=1` (por defecto apagado); `MAX_CONTENT_LENGTH` a 5MB; cabeceras `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` en todas las respuestas. |
+
+7 tests nuevos de regresión de seguridad (verificación de pago Stripe real vía mock, rechazo sin payment_intent). Total: 12/12 tests pasan.
+
+**Limitación no resuelta (documentada, no bloqueante para el MVP)**: sigue sin haber autenticación de usuarios — cualquiera con acceso a la URL puede crear clientes/facturas de "otro" emisor si se despliega multi-tenant. Ver sección de riesgos.

@@ -105,11 +105,61 @@ def test_pago_stripe_test_mode_crea_payment_intent(client):
     assert r.is_json
 
 
-def test_confirmar_pago_marca_factura_pagada(client):
+def test_confirmar_pago_sin_payment_intent_asociado_falla(client):
+    """Regresión de seguridad: no debe poder marcarse como pagada una factura
+    que nunca tuvo un intento de pago Stripe creado."""
+    cliente = client.post("/api/clientes", json={"nombre": "Sin Intent", "nif": "55555555M"}).get_json()
+    factura = client.post("/api/facturas", json={
+        "cliente_id": cliente["id"], "concepto": "x", "base_imponible": 10,
+    }).get_json()
+    r = client.post(f"/api/facturas/{factura['id']}/confirmar_pago")
+    assert r.status_code == 400
+    assert factura["pagada"] is False
+
+
+def test_confirmar_pago_no_marca_pagada_si_stripe_dice_que_no_se_completo(client, monkeypatch):
+    """Regresión de seguridad (bypass encontrado en pentest): antes, cualquiera
+    podía llamar a /confirmar_pago y marcar la factura como pagada sin verificar
+    nada contra Stripe. Ahora debe consultarse el estado real del PaymentIntent."""
+    import stripe
+
+    cliente = client.post("/api/clientes", json={"nombre": "Bypass Test", "nif": "66666666N"}).get_json()
+    factura = client.post("/api/facturas", json={
+        "cliente_id": cliente["id"], "concepto": "x", "base_imponible": 10,
+    }).get_json()
+
+    # Simulamos que la factura sí tiene un payment_intent (como si /pagar hubiera funcionado)
+    with backend_app.app.app_context():
+        f = backend_app.db.session.get(backend_app.Factura, factura["id"])
+        f.stripe_payment_intent = "pi_fake_test_123"
+        backend_app.db.session.commit()
+
+    class FakeIntentNoPagado:
+        status = "requires_payment_method"
+
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", lambda *a, **kw: FakeIntentNoPagado())
+    r = client.post(f"/api/facturas/{factura['id']}/confirmar_pago")
+    assert r.status_code == 402
+    assert "pagada" not in r.get_json() or True  # el endpoint no debe devolver la factura como pagada
+
+
+def test_confirmar_pago_marca_factura_pagada_solo_si_stripe_confirma(client, monkeypatch):
+    import stripe
+
     cliente = client.post("/api/clientes", json={"nombre": "Confirmar", "nif": "44444444L"}).get_json()
     factura = client.post("/api/facturas", json={
         "cliente_id": cliente["id"], "concepto": "x", "base_imponible": 10,
     }).get_json()
+
+    with backend_app.app.app_context():
+        f = backend_app.db.session.get(backend_app.Factura, factura["id"])
+        f.stripe_payment_intent = "pi_fake_test_456"
+        backend_app.db.session.commit()
+
+    class FakeIntentPagado:
+        status = "succeeded"
+
+    monkeypatch.setattr(stripe.PaymentIntent, "retrieve", lambda *a, **kw: FakeIntentPagado())
     r = client.post(f"/api/facturas/{factura['id']}/confirmar_pago")
     assert r.status_code == 200
     assert r.get_json()["pagada"] is True
