@@ -52,11 +52,17 @@
 </fieldset>
 
 <script>
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = (str === null || str === undefined) ? '' : String(str);
+  return div.innerHTML;
+}
+
 async function cargarClientes() {
   const r = await fetch('/api/clientes');
   const data = await r.json();
   const sel = document.getElementById('f_cliente');
-  sel.innerHTML = data.map(c => `<option value="${c.id}">${c.nombre} (${c.nif})</option>`).join('');
+  sel.innerHTML = data.map(c => `<option value="${c.id}">${escapeHtml(c.nombre)} (${escapeHtml(c.nif)})</option>`).join('');
 }
 
 async function altaCliente() {
@@ -105,10 +111,10 @@ async function cargarFacturas() {
   const data = await r.json();
   const tbody = document.querySelector('#tabla_facturas tbody');
   tbody.innerHTML = data.map(f => `<tr>
-    <td>${f.numserie}</td>
-    <td>${f.cliente ? f.cliente.nombre : ''}</td>
+    <td>${escapeHtml(f.numserie)}</td>
+    <td>${f.cliente ? escapeHtml(f.cliente.nombre) : ''}</td>
     <td>${f.total} €</td>
-    <td title="${f.hash_registro}">${f.hash_registro.slice(0,10)}...</td>
+    <td title="${escapeHtml(f.hash_registro)}">${escapeHtml(f.hash_registro.slice(0,10))}...</td>
     <td><a href="/api/facturas/${f.id}/pdf" target="_blank">PDF</a></td>
     <td>${f.pagada ? 'Pagada ✅' : `<button onclick="pagarFactura(${f.id})">Pagar (test)</button>`}</td>
   </tr>`).join('');

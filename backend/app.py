@@ -215,7 +215,7 @@ def facturas():
         if not (0 <= tipo_iva <= 100) or not (0 <= tipo_irpf <= 100):
             return jsonify({"error": "tipos de IVA/IRPF fuera de rango"}), 400
 
-        cliente = Cliente.query.get(cliente_id)
+        cliente = db.session.get(Cliente, cliente_id)
         if not cliente:
             return jsonify({"error": "cliente no encontrado"}), 404
 
